@@ -1,0 +1,110 @@
+# =====================================================================
+# pyproject.toml: the single config file for this Python project.
+# Defines the project, its dependencies, and settings for dev tools.
+# =====================================================================
+
+
+# ---------------------------------------------------------------------
+# [project]: who this project is and what it needs to run
+# ---------------------------------------------------------------------
+[project]
+# Package name (lowercase, dashes). Matches the repo name.
+name = "portfolio-risk-service"
+
+# Your project's version. Bump it when you cut releases.
+version = "0.1.0"
+
+# One-line summary, shown by pip and package indexes.
+description = "Portfolio risk analytics API: market-data ingestion, SQL-based risk metrics, FastAPI."
+
+# Minimum Python version. You have 3.11 locally; Docker will use 3.12.
+requires-python = ">=3.11"
+
+# Runtime dependencies: what the app needs to RUN.
+# ">=" means "this version or newer."
+dependencies = [
+    "fastapi>=0.115",           # The web framework for the REST API
+    "uvicorn[standard]>=0.30",  # The server that runs the FastAPI app
+    "pydantic>=2.7",            # Data validation; defines request/response shapes
+    "pydantic-settings>=2.3",   # Loads config from environment variables / .env
+    "sqlalchemy>=2.0",          # Database toolkit: connections, queries, ORM
+    "alembic>=1.13",            # Database migrations (versioned schema changes)
+    "psycopg[binary]>=3.2",     # The Postgres driver (the "psycopg" in DATABASE_URL)
+    "pandas>=2.2",              # Data analysis; the reference implementation for metrics
+    "numpy>=1.26",              # Fast math on arrays; pandas is built on it
+    "httpx>=0.27",              # HTTP client for calling the market-data API
+]
+
+
+# ---------------------------------------------------------------------
+# Optional dependency groups: extras you install on purpose.
+# "dev" = tools for developing and testing, NOT needed to run the app.
+# Installed with: pip install -e ".[dev]"
+# ---------------------------------------------------------------------
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",     # Test runner
+    "ruff>=0.6",       # Linter + formatter (catches bugs and style issues fast)
+    "mypy>=1.11",      # Static type checker (checks your type hints)
+    "pandas-stubs",    # Type information for pandas, so mypy understands it
+]
+
+
+# ---------------------------------------------------------------------
+# [build-system]: how pip turns this folder into an installable package.
+# setuptools is the standard, long-established choice.
+# ---------------------------------------------------------------------
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+# Tell setuptools which folders are your code packages.
+# Without this, it might also try to package tests, web/, etc.
+[tool.setuptools.packages.find]
+include = ["api*", "ingest*"]
+
+
+# ---------------------------------------------------------------------
+# [tool.ruff]: linter settings
+# ---------------------------------------------------------------------
+[tool.ruff]
+# Max characters per line before ruff complains.
+line-length = 100
+
+# Lets ruff suggest modern syntax that works on Python 3.11.
+target-version = "py311"
+
+[tool.ruff.lint]
+# Which rule sets to enforce:
+#   E   = pycodestyle errors (basic style)
+#   F   = pyflakes (unused imports, undefined names: real bugs)
+#   I   = isort (import ordering)
+#   B   = bugbear (common bug patterns)
+#   UP  = pyupgrade (use modern Python syntax)
+#   SIM = simplify (flags code that can be written more simply)
+select = ["E", "F", "I", "B", "UP", "SIM"]
+
+
+# ---------------------------------------------------------------------
+# [tool.mypy]: type checker settings
+# ---------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+
+# Strict mode: every function needs type hints, no silent "Any" types.
+# Stricter than most projects; it's here to show typed Python.
+strict = true
+
+# Teaches mypy how Pydantic models work, so it doesn't raise false errors.
+plugins = ["pydantic.mypy"]
+
+# Skip Alembic's migration files; they're generated boilerplate.
+exclude = ["api/migrations/"]
+
+
+# ---------------------------------------------------------------------
+# [tool.pytest.ini_options]: test runner settings
+# ---------------------------------------------------------------------
+[tool.pytest.ini_options]
+# Where pytest looks for tests.
+testpaths = ["api/tests", "ingest/tests"]
