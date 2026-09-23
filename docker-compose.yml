@@ -1,0 +1,44 @@
+# =====================================================================
+# docker-compose.yml: defines the containers that make up the app.
+# For now: just the Postgres database. The API and ingestion job
+# get added as services in later steps.
+# =====================================================================
+
+services:
+
+  # The service name "db" is also its hostname inside Docker Compose.
+  # (That's why DATABASE_URL uses "db" instead of "localhost" in-container.)
+  db:
+    # Official Postgres image, major version 16.
+    image: postgres:16
+
+    # Settings the image reads on FIRST startup to create the user/database.
+    # ${VAR:-default} = use VAR from your .env file, or the default if unset.
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-risk}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-risk}
+      POSTGRES_DB: ${POSTGRES_DB:-risk}
+
+    # "host:container". Exposes the container's port 5432 on your machine's
+    # port 5432, so Python on your laptop can reach it at localhost:5432.
+    ports:
+      - "5432:5432"
+
+    # Stores the database files in a named Docker volume, so your data
+    # survives "docker compose down" and restarts. Without this, every
+    # restart would start with an empty database.
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+    # Docker repeatedly asks Postgres "are you ready?" (pg_isready).
+    # Later, the API service will wait for this to pass before starting,
+    # instead of crashing because the database isn't up yet.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-risk} -d ${POSTGRES_DB:-risk}"]
+      interval: 5s   # check every 5 seconds
+      timeout: 3s    # each check fails if no answer within 3 seconds
+      retries: 10    # "unhealthy" after 10 failures in a row
+
+# Declares the named volume used above. Docker manages where it lives.
+volumes:
+  pgdata:
