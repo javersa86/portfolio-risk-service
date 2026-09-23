@@ -16,7 +16,7 @@ class PriceBar:
 
     ticker: str
     date: date
-    open: Decimal | None      # Decimal, not float: exact, matches NUMERIC
+    open: Decimal | None  # Decimal, not float: exact, matches NUMERIC
     high: Decimal | None
     low: Decimal | None
     close: Decimal

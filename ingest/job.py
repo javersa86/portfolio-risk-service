@@ -59,21 +59,23 @@ def ingest(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Ingest daily prices into Postgres.")
-    parser.add_argument("--start", type=date.fromisoformat,
-                        default=date.today() - timedelta(days=730))  # ~2 years back
+    parser.add_argument(
+        "--start", type=date.fromisoformat, default=date.today() - timedelta(days=730)
+    )  # ~2 years back
     parser.add_argument("--end", type=date.fromisoformat, default=date.today())
     parser.add_argument("--tickers", help="Comma-separated; overrides TICKERS in .env")
     args = parser.parse_args()
 
     tickers = (
         [t.strip().upper() for t in args.tickers.split(",")]
-        if args.tickers else settings.ticker_list
+        if args.tickers
+        else settings.ticker_list
     )
     total = ingest(
         get_engine(),
         get_provider(settings.price_provider, settings.price_provider_api_key),
-        tickers, 
-        args.start, 
+        tickers,
+        args.start,
         args.end,
     )
     print(f"Done: {total} rows upserted for {len(tickers)} tickers.")

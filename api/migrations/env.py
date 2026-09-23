@@ -20,8 +20,12 @@ target_metadata = None
 
 
 def run_migrations_online() -> None:
-    """Connect to the database and run the pending migrations."""
-    with get_engine().connect() as connection:
+    """
+    Connect to the database and run the pending migrations.
+    """
+    # Use a URL passed in by the caller (the test setup) if there is one,
+    # otherwise fall back to DATABASE_URL from settings.
+    with get_engine(config.attributes.get("database_url")).connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata)
         # Each migration runs inside a transaction: if any statement fails,
         # the whole migration rolls back instead of leaving a half-built schema.
