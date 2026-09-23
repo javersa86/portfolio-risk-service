@@ -12,8 +12,10 @@ The **TypeScript** dashboard's API types are generated from the backend's OpenAP
 so the Python and TypeScript sides share one contract. A change to a response model in
 Python breaks the frontend build until the dashboard is updated to match.
 
-> ⚠️ This project is in early development. Nothing below is built yet unless it is checked
-> off in the [Roadmap](#roadmap).
+> ⚠️ **Status: Milestone 1 (foundation) is complete**: database, schema, idempotent price
+> ingestion from a real market-data API, tests, and CI. The risk analytics, API, and
+> dashboard described below are planned. See [How It Works Today](#how-it-works-today) for
+> what runs now, and the [Roadmap](#roadmap) for what's next.
 
 ---
 
@@ -21,18 +23,19 @@ Python breaks the frontend build until the dashboard is updated to match.
 1. [Overview](#overview)
 2. [Features](#features)
 3. [Architecture](#architecture)
-4. [Finance Terms in Plain English](#finance-terms-in-plain-english)
-5. [Risk Metrics](#risk-metrics)
-6. [SQL Design](#sql-design)
-7. [API](#api)
-8. [Type Safety Across the Stack](#type-safety-across-the-stack)
-9. [Tech Stack](#tech-stack)
-10. [Project Structure](#project-structure)
-11. [Getting Started](#getting-started)
-12. [Testing](#testing)
-13. [Design Decisions](#design-decisions)
-14. [Roadmap](#roadmap)
-15. [Out of Scope](#out-of-scope)
+4. [How It Works Today](#how-it-works-today)
+5. [Finance Terms in Plain English](#finance-terms-in-plain-english)
+6. [Risk Metrics](#risk-metrics)
+7. [SQL Design](#sql-design)
+8. [API](#api)
+9. [Type Safety Across the Stack](#type-safety-across-the-stack)
+10. [Tech Stack](#tech-stack)
+11. [Project Structure](#project-structure)
+12. [Getting Started](#getting-started)
+13. [Testing](#testing)
+14. [Design Decisions](#design-decisions)
+15. [Roadmap](#roadmap)
+16. [Out of Scope](#out-of-scope)
 
 ---
 
@@ -88,6 +91,93 @@ flowchart LR
 - The **dashboard** talks to the API only through a typed client generated from the
   OpenAPI schema. In development, Vite proxies `/api` to FastAPI; in production, FastAPI
   serves the built dashboard as static files, so the whole app runs at a single URL.
+
+---
+
+## How It Works Today
+
+What is built and running as of Milestone 1. Everything here is covered by the test suite
+and runs in CI on every push.
+
+```mermaid
+flowchart LR
+    ENV[.env] -->|settings| JOB[ingest.job]
+    CSV[Fixture CSV] -.->|PRICE_PROVIDER=fixture| JOB
+    TI[Tiingo REST API] -.->|PRICE_PROVIDER=tiingo| JOB
+    JOB -->|upsert, one transaction per ticker| DB[(PostgreSQL 16<br/>tickers, prices)]
+    ALE[Alembic migration] -->|creates schema| DB
+```
+
+### 1. Configuration
+All settings live in `.env` (copied from `.env.example`, never committed). `api/app/config.py`
+loads them with pydantic-settings, so no connection string or API key is hard-coded
+anywhere. See [Configuration](#configuration) for every variable.
+
+### 2. Database and schema
+PostgreSQL 16 runs in Docker Compose, with its data in a named volume so it survives
+restarts. The schema is created by an Alembic migration written in plain SQL
+(`api/migrations/versions/`):
+
+- **`tickers`**: one row per symbol. A `CHECK` forces uppercase, so `aapl` and `AAPL` can't
+  both exist.
+- **`prices`**: one row per ticker per trading day, with the composite primary key
+  `(ticker, date)`. Prices are `NUMERIC(18, 6)`, exact decimals rather than floats, and
+  `CHECK` constraints reject non-positive prices and negative volume at the database level.
+  A foreign key ties every price to a known ticker.
+
+The composite key is the central design choice: it is what makes ingestion idempotent, and
+it doubles as the index the Milestone 2 window functions will scan.
+
+### 3. Price providers (the adapter pattern)
+The ingestion job never talks to a data source directly. It depends on one small interface,
+`PriceProvider.fetch(ticker, start, end) -> list[PriceBar]` (`ingest/providers/base.py`),
+and `get_provider()` picks the implementation from `PRICE_PROVIDER`:
+
+| Provider | Source | Used for |
+|---|---|---|
+| `fixture` | `ingest/fixtures/prices.csv`: 5 days of made-up AAPL and SPY prices with round numbers | Tests, and development without an API key |
+| `tiingo` | Tiingo's end-of-day REST API | Real data |
+
+The Tiingo provider sends the API token in a request header (never the URL, so it can't
+leak into logs), sets a 30-second timeout, raises on any HTTP error, and parses JSON numbers
+straight into `Decimal` so prices never pass through floating point.
+
+### 4. Ingestion job
+`python -m ingest.job` does the following for each ticker:
+
+1. Inserts the ticker into `tickers` if it isn't there yet (`ON CONFLICT DO NOTHING`).
+2. Fetches daily bars from the configured provider.
+3. Upserts them into `prices` with `INSERT ... ON CONFLICT (ticker, date) DO UPDATE`: new
+   days are inserted, existing days are overwritten with the latest values, and
+   `ingested_at` records when each row was last loaded.
+
+Each ticker runs in **its own transaction**, so one failing ticker (a bad symbol, an API
+error) rolls back only itself and the tickers already loaded stay committed. **Running the
+job twice never creates duplicates**, and a corrected price from the provider replaces the
+old value in place.
+
+Current dataset: **8 tickers × 501 trading days** (2024-09-23 to 2026-09-22).
+
+### 5. Tests
+`conftest.py` gives the tests a real Postgres database, `risk_test`, separate from
+development data. It creates the database if needed, runs the real Alembic migrations on
+it, and empties the tables before each test. The seven tests cover:
+
+| Test | Proves |
+|---|---|
+| `test_fixture_provider_filters_by_ticker_and_date` | The CSV provider returns only the requested ticker and dates, in order, as exact `Decimal`s |
+| `test_tiingo_maps_json_to_price_bars` | Tiingo's JSON maps correctly onto `PriceBar`, using a mocked HTTP transport with no network and no API key |
+| `test_tiingo_raises_on_http_error` | An HTTP error (e.g. unknown ticker) raises instead of silently returning nothing |
+| `test_ingest_loads_all_rows` | A fresh ingest loads every row |
+| `test_ingest_is_idempotent` | Running ingestion twice leaves the row count unchanged |
+| `test_ingest_updates_changed_price` | A changed price updates the existing row rather than adding one |
+| `test_database_rejects_non_positive_price` | The `CHECK` constraint blocks bad data regardless of which code writes it |
+
+### 6. Continuous integration
+`.github/workflows/ci.yml` runs on every push and pull request: a fresh Ubuntu runner,
+a throwaway Postgres 16 service container, Python 3.11, then four gates in order:
+`ruff format --check`, `ruff check`, `mypy` in strict mode, and `pytest`. Any failure marks
+the commit red. CI needs no secrets, since no test touches the real API.
 
 ---
 
@@ -153,21 +243,21 @@ one-day loss is expected to be exceeded on only 5% of days at 95% confidence).
 
 ## SQL Design
 
-### Schema (planned)
+### Schema
 
-| Table / View | Purpose |
-|---|---|
-| `tickers` | Symbol, name, active flag |
-| `prices` | `(ticker, date)` primary key, OHLC + adjusted close, volume |
-| `portfolios` | Portfolio metadata |
-| `portfolio_weights` | `(portfolio_id, ticker)` primary key, weight |
-| `daily_returns` | Materialized view of per-ticker daily returns, refreshed after ingest |
+| Table / View | Purpose | Status |
+|---|---|---|
+| `tickers` | Symbol, name, active flag | ✅ Built (M1) |
+| `prices` | `(ticker, date)` primary key, OHLC + adjusted close, volume | ✅ Built (M1) |
+| `portfolios` | Portfolio metadata | Planned (M2) |
+| `portfolio_weights` | `(portfolio_id, ticker)` primary key, weight | Planned (M2) |
+| `daily_returns` | Materialized view of per-ticker daily returns, refreshed after ingest | Planned (M2) |
 
 ### Key techniques
 
 | Need | SQL feature |
 |---|---|
-| Idempotent ingestion | `INSERT ... ON CONFLICT (ticker, date) DO UPDATE` |
+| Idempotent ingestion ✅ | `INSERT ... ON CONFLICT (ticker, date) DO UPDATE` |
 | Daily returns | `LAG(adj_close) OVER (PARTITION BY ticker ORDER BY date)` |
 | Rolling volatility | `STDDEV_SAMP(ret) OVER (PARTITION BY ticker ORDER BY date ROWS 251 PRECEDING)` |
 | Portfolio returns | Join `daily_returns` to `portfolio_weights`, `SUM(ret * weight)` grouped by date |
@@ -297,7 +387,7 @@ portfolio-risk-service/
 │       └── ...
 ├── ingest/
 │   ├── providers/               # Data-provider adapter interface + implementations
-│   ├── job.py                   # Fetch, upsert, refresh materialized view
+│   ├── job.py                   # Fetch + upsert (materialized-view refresh added in M2)
 │   └── tests/
 ├── web/                         # React + TS dashboard
 │   ├── src/
@@ -318,21 +408,69 @@ portfolio-risk-service/
 
 ## Getting Started
 
-> These commands describe the intended workflow and will work once Milestone 1 lands.
+Commands are shown for Windows PowerShell; on macOS/Linux, activate the virtual environment
+with `source .venv/bin/activate` instead.
 
 ### Prerequisites
-- Docker Desktop
-- Python 3.11+ (for running tests outside Docker; the containers use 3.12)
-- Node.js 20+ (for the dashboard)
+- Docker Desktop (running)
+- Python 3.11+ (CI runs on 3.11)
+- A free [Tiingo](https://www.tiingo.com/) API token, only for real market data. Everything
+  else, including the full test suite, works without one.
 
-### Run everything
-```bash
-docker compose up --build
+### 1. Install
+```powershell
+git clone https://github.com/javersa86/portfolio-risk-service.git
+cd portfolio-risk-service
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -e ".[dev]"
+Copy-Item .env.example .env
 ```
-- API: http://localhost:8000 (docs at http://localhost:8000/docs)
-- Dashboard: http://localhost:5173
 
-### Dashboard development
+### 2. Start Postgres and create the schema
+```powershell
+docker compose up -d db          # Postgres 16 in the background
+docker compose ps                # wait until db shows "healthy"
+alembic upgrade head             # create the tickers and prices tables
+```
+
+### 3. Load prices
+With the default `PRICE_PROVIDER=fixture`, no API key needed:
+```powershell
+python -m ingest.job --start 2026-09-01 --end 2026-09-30 --tickers AAPL,SPY
+```
+For real data, set `PRICE_PROVIDER=tiingo` and `PRICE_PROVIDER_API_KEY` in `.env`, then
+backfill two years for every symbol in `TICKERS`:
+```powershell
+python -m ingest.job
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--start` | today minus 730 days | First date to fetch (`YYYY-MM-DD`) |
+| `--end` | today | Last date to fetch, inclusive |
+| `--tickers` | `TICKERS` from `.env` | Comma-separated symbols, overriding `.env` |
+
+Re-running any of these is safe: existing rows update in place, and nothing duplicates.
+
+### 4. Inspect the data
+```powershell
+docker compose exec db psql -U risk -d risk -c "SELECT ticker, count(*), min(date), max(date) FROM prices GROUP BY ticker ORDER BY ticker;"
+```
+
+### Useful commands
+| Command | What it does |
+|---|---|
+| `docker compose logs db` | Postgres logs, the first place to look if something won't connect |
+| `docker compose down` | Stop Postgres; data is kept in the volume |
+| `docker compose down -v` | Stop Postgres **and delete all data**, for a clean start (rerun step 2 afterward) |
+| `alembic downgrade base` | Drop all tables through the migrations |
+
+### Coming in later milestones
+The API (`uvicorn`, http://localhost:8000/docs), a one-command `docker compose up` for the
+whole stack, and the dashboard (http://localhost:5173) arrive in Milestones 2 to 4.
+
+### Dashboard development (Milestone 4, planned)
 ```bash
 cd web
 npm install
@@ -342,37 +480,50 @@ npm run typecheck   # tsc --noEmit
 ```
 Run `gen:types` whenever a Pydantic request or response model changes.
 
-### Seed prices
-```bash
-docker compose run --rm ingest python -m ingest.job --backfill 2y
-```
-
 ### Configuration
+Set in `.env`. `.env.example` documents each one.
+
 | Variable | Default | Purpose |
 |---|---|---|
-| `DATABASE_URL` | `postgresql+psycopg://risk:risk@db:5432/risk` | Postgres connection |
-| `PRICE_PROVIDER` | TBD | Which data-provider adapter to use (Stooq ruled out 2026-09-23: blocks scripted downloads) |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `risk` / `risk` / `risk` | Used by the Postgres container on first start (local development only) |
+| `DATABASE_URL` | `postgresql+psycopg://risk:risk@localhost:5432/risk` | Connection used by ingestion and Alembic |
+| `PRICE_PROVIDER` | `fixture` | `fixture` (local CSV) or `tiingo` (real data). Stooq was ruled out 2026-09-23 because it blocks scripted downloads |
+| `PRICE_PROVIDER_API_KEY` | *(empty)* | Tiingo token. **Only in `.env`, never committed** |
 | `TICKERS` | `SPY,QQQ,AAPL,MSFT,JPM,GS,TLT,GLD` | Symbols to ingest |
-| `INGEST_CRON` | `0 22 * * 1-5` | When the daily ingest runs (after US market close) |
+| `TEST_DATABASE_URL` | `postgresql+psycopg://risk:risk@localhost:5432/risk_test` | Test database; created automatically by the test suite |
+
+Planned for Milestone 3: `INGEST_CRON` (default `0 22 * * 1-5`, after US market close) for
+scheduled ingestion.
 
 ---
 
 ## Testing
 
-```bash
-docker compose run --rm api pytest
+With Postgres running (`docker compose up -d db`), run the same four checks CI runs:
+```powershell
+ruff format --check .    # formatting (drop --check to auto-fix)
+ruff check .             # lint (add --fix for safe automatic fixes)
+mypy api ingest          # strict type checking
+pytest -v                # 7 tests against a real Postgres test database
 ```
+The tests use their own `risk_test` database and never touch development data or the
+network. See [How It Works Today](#5-tests) for what each test proves.
 
+**In place now (M1):**
 - **Deterministic fixtures:** tests run against a fixed price dataset, never live market data.
-- **SQL vs. pandas cross-check:** each metric's SQL implementation is asserted to match its
+- **Real database:** integration tests run against Postgres, not SQLite, with the real
+  migrations applied, so constraints and SQL behave exactly as in production.
+- **Mocked HTTP:** the Tiingo provider is tested with `httpx.MockTransport`, with no network
+  and no API key.
+
+**Planned:**
+- **SQL vs. pandas cross-check (M2):** each metric's SQL implementation is asserted to match its
   pandas reference within a tolerance. A disagreement fails CI.
-- **Hand-verified cases:** a handful of tiny datasets with metrics computed by hand, so both
-  implementations are checked against known answers, not just each other.
-- **Real database:** integration tests run against Postgres in a container, not SQLite, so
-  window functions and `PERCENTILE_CONT` behave exactly as in production.
-- **Frontend:** `npm test` runs Vitest component tests against mocked API responses built
+- **Hand-verified cases (M2):** a handful of tiny datasets with metrics computed by hand,
+  so both implementations are checked against known answers, not just each other.
+- **Frontend (M4):** `npm test` runs Vitest component tests against mocked API responses built
   from the generated types, so the mocks can't drift from the real response shape.
-- **Contract check:** CI fails if `web/src/api/schema.ts` doesn't match the backend's
+- **Contract check (M4):** CI fails if `web/src/api/schema.ts` doesn't match the backend's
   current OpenAPI schema.
 
 ---
@@ -400,12 +551,12 @@ To be filled in as the project is built. Planned topics:
 ## Roadmap
 
 ### Milestone 1: Foundation
-- [ ] Repo scaffold, Docker Compose (db, api, ingest)
-- [ ] Schema and Alembic migrations
-- [ ] Provider adapter interface + first provider
-- [ ] Idempotent ingestion with upsert
-- [ ] Fixture dataset and first tests
-- [ ] CI green (ruff, mypy, pytest)
+- [X] Repo scaffold, Docker Compose (Postgres)
+- [X] Schema and Alembic migrations
+- [X] Provider adapter interface + first provider
+- [X] Idempotent ingestion with upsert
+- [X] Fixture dataset and first tests
+- [X] CI green (ruff, mypy, pytest)
 
 ### Milestone 2: Analytics and API
 - [ ] `daily_returns` materialized view
@@ -415,6 +566,7 @@ To be filled in as the project is built. Planned topics:
 - [ ] `EXPLAIN ANALYZE` results in [SQL Design](#sql-design)
 
 ### Milestone 3: Deploy
+- [ ] API and ingestion job as Docker Compose services (one-command `docker compose up`)
 - [ ] Deployed to a hosted environment with a live URL
 - [ ] Scheduled ingestion running in production
 - [ ] Architecture and design-decision sections completed
