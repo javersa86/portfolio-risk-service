@@ -69,8 +69,13 @@ def main() -> None:
         [t.strip().upper() for t in args.tickers.split(",")]
         if args.tickers else settings.ticker_list
     )
-    total = ingest(get_engine(), get_provider(settings.price_provider),
-                   tickers, args.start, args.end)
+    total = ingest(
+        get_engine(),
+        get_provider(settings.price_provider, settings.price_provider_api_key),
+        tickers, 
+        args.start, 
+        args.end,
+    )
     print(f"Done: {total} rows upserted for {len(tickers)} tickers.")
 
 
